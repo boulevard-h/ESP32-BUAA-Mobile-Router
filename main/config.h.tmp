@@ -1,0 +1,19 @@
+
+/*
+    config.h
+    config for STA and AP
+*/
+#ifndef CONFIG_H
+#define CONFIG_H
+
+// STA config
+#define STA_WIFI_SSID "BUAA-Mobile"
+#define STA_EAP_USERNAME "Your username"
+#define STA_EAP_PASSWORD "Your password"
+
+// AP config
+#define AP_WIFI_SSID "ESP32-Router"
+#define AP_WIFI_PASSWORD "Your password"
+#define AP_MAX_CONNECTIONS 4
+
+#endif
