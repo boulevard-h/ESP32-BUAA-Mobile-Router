@@ -32,6 +32,11 @@
 #include "lwip/sys.h"
 #include "esp_eap_client.h"
 #include "config.h"
+#include "esp_timer.h"
+#include "esp_system.h"
+#include "esp_sleep.h"
+#include <time.h>
+#include "esp_sntp.h"
 
 
 /* The event group allows multiple bits for each event, but we only care about two events:
@@ -45,11 +50,15 @@
 
 static const char *TAG_AP = "WiFi SoftAP";
 static const char *TAG_STA = "WiFi Sta";
+static const char *TAG_TIME = "Time Sync";
 
 static int s_retry_num = 0;
 
 /* FreeRTOS event group to signal when we are connected/disconnected */
 static EventGroupHandle_t s_wifi_event_group;
+
+// 定时重启任务句柄
+static TaskHandle_t restart_task_handle = NULL;
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
@@ -148,6 +157,80 @@ void softap_set_dns_addr(esp_netif_t *esp_netif_ap,esp_netif_t *esp_netif_sta)
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_netif_dhcps_start(esp_netif_ap));
 }
 
+// 时间同步回调函数
+static void time_sync_notification_cb(struct timeval *tv)
+{
+    time_t now;
+    struct tm timeinfo;
+    time(&now);
+    localtime_r(&now, &timeinfo);
+    char strftime_buf[64];
+    strftime(strftime_buf, sizeof(strftime_buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
+    ESP_LOGI(TAG_TIME, "时间已同步 (北京时间): %s", strftime_buf);
+}
+
+// 初始化SNTP服务
+static void initialize_sntp(void)
+{
+    ESP_LOGI(TAG_TIME, "初始化SNTP");
+    
+    // 设置时区为北京时间 UTC+8
+    setenv("TZ", "CST-8", 1);
+    tzset();
+    
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "ntp.aliyun.com");
+    esp_sntp_setservername(1, "cn.pool.ntp.org");
+    esp_sntp_set_time_sync_notification_cb(time_sync_notification_cb);
+    esp_sntp_init();
+}
+
+// 定时重启任务
+static void restart_task(void *pvParameters)
+{
+    // 等待WiFi连接成功
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+                                           WIFI_CONNECTED_BIT,
+                                           pdFALSE,
+                                           pdFALSE,
+                                           portMAX_DELAY);
+    if (bits & WIFI_CONNECTED_BIT) {
+        // 初始化SNTP
+        initialize_sntp();
+        
+        // 等待时间同步
+        int retry = 0;
+        const int retry_count = 10;
+        while (sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET && ++retry < retry_count) {
+            ESP_LOGI(TAG_TIME, "等待系统时间同步... (%d/%d)", retry, retry_count);
+            vTaskDelay(2000 / portTICK_PERIOD_MS);
+        }
+    }
+    
+    // 无限循环，检查当前时间
+    while (1) {
+        if (AUTO_RESTART_ENABLE) {
+            time_t now;
+            struct tm timeinfo;
+            time(&now);
+            localtime_r(&now, &timeinfo);
+            
+            // 检查是否到达重启时间
+            if (timeinfo.tm_hour == RESTART_HOUR && timeinfo.tm_min == RESTART_MINUTE) {
+                // 重启时间设置为60s，太短的话将在一分钟内重启多次
+                ESP_LOGI(TAG_TIME, "到达计划重启时间: %02d:%02d，系统将在60秒后重启...", 
+                         RESTART_HOUR, RESTART_MINUTE);
+                vTaskDelay(60000 / portTICK_PERIOD_MS);
+                esp_restart();
+            }
+        }
+        
+        // 每分钟检查一次
+        vTaskDelay(60000 / portTICK_PERIOD_MS);
+    }
+
+}
+
 void app_main(void)
 {
     ESP_ERROR_CHECK(esp_netif_init());
@@ -192,6 +275,9 @@ void app_main(void)
 
     /* Start WiFi */
     ESP_ERROR_CHECK(esp_wifi_start() );
+
+    /* 创建定时重启任务 */
+    xTaskCreate(restart_task, "restart_task", 4096, NULL, 5, &restart_task_handle);
 
     /*
      * Wait until either the connection is established (WIFI_CONNECTED_BIT) or
